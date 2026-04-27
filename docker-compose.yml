@@ -1,0 +1,33 @@
+
+services:
+  payments-api:
+    build:
+      context: ./payments-api
+    env_file:
+      - .env
+    environment:
+      PAYMENTS_API_DB_HOST: payments-api-postgres
+    ports:
+      - "8080:8080"
+    depends_on:
+      payments-api-postgres:
+        condition: service_healthy
+
+  payments-api-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${PAYMENTS_API_DB_NAME:-payments_api}
+      POSTGRES_USER: ${PAYMENTS_API_DB_USER:-payments_api}
+      POSTGRES_PASSWORD: ${PAYMENTS_API_DB_PASSWORD:-change-me}
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PAYMENTS_API_DB_USER:-payments_api} -d ${PAYMENTS_API_DB_NAME:-payments_api}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - payments-api-postgres:/var/lib/postgresql/data
+
+volumes:
+  payments-api-postgres:

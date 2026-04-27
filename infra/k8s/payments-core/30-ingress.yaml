@@ -1,0 +1,136 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: payments-frontend
+  namespace: payments-core
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - pay-dev.79.137.32.27.nip.io
+      secretName: pay-dev-tls
+  rules:
+    - host: pay-dev.79.137.32.27.nip.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: payments-frontend
+                port:
+                  number: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: payments-api
+  namespace: payments-core
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - pay-api-dev.79.137.32.27.nip.io
+      secretName: pay-api-dev-tls
+  rules:
+    - host: pay-api-dev.79.137.32.27.nip.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: payments-api
+                port:
+                  number: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hyperswitch
+  namespace: payments-core
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - switch-dev.79.137.32.27.nip.io
+      secretName: switch-dev-tls
+  rules:
+    - host: switch-dev.79.137.32.27.nip.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: hyperswitch
+                port:
+                  number: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: stellar-sep
+  namespace: payments-core
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - anchor-dev.79.137.32.27.nip.io
+      secretName: anchor-dev-tls
+  rules:
+    - host: anchor-dev.79.137.32.27.nip.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: stellar-platform
+                port:
+                  number: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: stellar-reference
+  namespace: payments-core
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - anchor-ref-dev.79.137.32.27.nip.io
+      secretName: anchor-ref-dev-tls
+  rules:
+    - host: anchor-ref-dev.79.137.32.27.nip.io
+      http:
+        paths:
+          - path: /healthz
+            pathType: Exact
+            backend:
+              service:
+                name: anchor-ref-health
+                port:
+                  number: 80
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: stellar-reference-server
+                port:
+                  number: 8091

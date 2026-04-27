@@ -1,0 +1,331 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: payments-core
+  labels:
+    app.kubernetes.io/part-of: payments
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: payments-core-quota
+  namespace: payments-core
+spec:
+  hard:
+    requests.cpu: "4000m"
+    limits.cpu: "9000m"
+    requests.memory: 6Gi
+    limits.memory: 14Gi
+    pods: "20"
+    persistentvolumeclaims: "6"
+    services: "20"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: payments-core-defaults
+  namespace: payments-core
+spec:
+  limits:
+    - type: Container
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      default:
+        cpu: 500m
+        memory: 512Mi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stellar-config
+  namespace: payments-core
+data:
+  APP_LOGGING_STELLAR_LEVEL: DEBUG
+  APP_LOGGING_REQUEST_LOGGER_ENABLED: "true"
+  LANGUAGES: en,fr
+  STELLAR_NETWORK_TYPE: rpc
+  STELLAR_NETWORK_RPC_URL: https://soroban-testnet.stellar.org
+  EVENTS_ENABLED: "true"
+  EVENTS_QUEUE_TYPE: kafka
+  EVENTS_QUEUE_KAFKA_BOOTSTRAP_SERVER: stellar-kafka:29092
+  EVENT_PROCESSOR_CALLBACK_API_REQUEST_ENABLED: "true"
+  CALLBACK_API_BASE_URL: http://stellar-reference-server:8091/
+  PLATFORM_API_BASE_URL: http://stellar-platform:8085
+  DATA_TYPE: postgres
+  DATA_SERVER: stellar-postgres:5432
+  DATA_DATABASE: postgres
+  DATA_SCHEMA: anchor_platform
+  DATA_FLYWAY_ENABLED: "true"
+  ASSETS_TYPE: file
+  ASSETS_VALUE: /config/assets.yaml
+  SEP1_ENABLED: "true"
+  SEP1_TOML_TYPE: file
+  SEP1_TOML_VALUE: /config/stellar.toml
+  SEP6_ENABLED: "true"
+  SEP6_MORE_INFO_URL_BASE_URL: https://anchor-ref-dev.79.137.32.27.nip.io/sep6/transaction/more_info
+  SEP10_ENABLED: "true"
+  SEP10_WEB_AUTH_DOMAIN: anchor-dev.79.137.32.27.nip.io
+  SEP10_HOME_DOMAINS: anchor-dev.79.137.32.27.nip.io
+  SEP12_ENABLED: "true"
+  SEP24_ENABLED: "true"
+  SEP24_INTERACTIVE_URL_BASE_URL: https://anchor-ref-dev.79.137.32.27.nip.io/sep24/interactive
+  SEP24_MORE_INFO_URL_BASE_URL: https://anchor-ref-dev.79.137.32.27.nip.io/sep24/transaction/more_info
+  SEP31_ENABLED: "true"
+  SEP38_ENABLED: "true"
+  SEP45_ENABLED: "true"
+  SEP45_WEB_AUTH_DOMAIN: anchor-dev.79.137.32.27.nip.io
+  SEP45_HOME_DOMAINS: anchor-dev.79.137.32.27.nip.io
+  SEP45_WEB_AUTH_CONTRACT_ID: CD3LA6RKF5D2FN2R2L57MWXLBRSEWWENE74YBEFZSSGNJRJGICFGQXMX
+  assets.yaml: |
+    assets:
+      - schema: stellar
+        code: native
+        distribution_account: GDZCLP2PHTWYQ3BWZMC5D4ZUJX5NU4S7YZHC5EBFAFKL6UJUQ5RKDGSY
+        significant_decimals: 7
+        deposit:
+          enabled: true
+          min_amount: 0
+          max_amount: 10
+        withdraw:
+          enabled: true
+          min_amount: 0
+          max_amount: 10
+        sep6_enabled: false
+        sep24_enabled: true
+        sep31_enabled: false
+        sep38_enabled: false
+      - schema: iso4217
+        code: USD
+        significant_decimals: 4
+        send:
+          min_amount: 0
+          max_amount: 1000000
+        sep38:
+          exchangeable_assets:
+            - stellar:native
+          country_codes:
+            - USA
+          decimals: 2
+          sell_delivery_methods:
+            - name: WIRE
+              description: Send USD directly to the anchor's bank account.
+          buy_delivery_methods:
+            - name: WIRE
+              description: Have USD sent directly to your bank account.
+        sep38_enabled: true
+      - schema: iso4217
+        code: CAD
+        significant_decimals: 4
+        send:
+          min_amount: 0
+          max_amount: 1000000
+        sep38:
+          exchangeable_assets:
+            - stellar:native
+          country_codes:
+            - CAN
+          decimals: 2
+          sell_delivery_methods:
+            - name: WIRE
+              description: Send CAD directly to the anchor's bank account.
+          buy_delivery_methods:
+            - name: WIRE
+              description: Have CAD sent directly to your bank account.
+        sep38_enabled: true
+  reference-config.yaml: |
+    app:
+      version: 0.0.1
+      isTest: true
+      port: 8091
+      horizonEndpoint: https://horizon-testnet.stellar.org
+      platformApiEndpoint: http://stellar-platform:8085
+      distributionWallet: GDZCLP2PHTWYQ3BWZMC5D4ZUJX5NU4S7YZHC5EBFAFKL6UJUQ5RKDGSY
+      distributionWalletMemo: ""
+      distributionWalletMemoType: ""
+      secret: replace-with-testnet-seed
+      enableTest: true
+      custodyEnabled: false
+      rpcEnabled: true
+    auth:
+      type: NONE
+      platformToAnchorSecret: replace-with-platform-to-anchor-secret
+      anchorToPlatformSecret: replace-with-anchor-to-platform-secret
+      expirationMilliseconds: 30000
+    sep24:
+      secret: replace-with-testnet-seed
+      interactiveJwtKey: replace-with-sep24-interactive-jwt-secret
+    data:
+      url: stellar-postgres:5432
+      database: postgres
+      user: postgres
+      password: replace-with-stellar-db-password
+  stellar.toml: |
+    ACCOUNTS = ["GDZCLP2PHTWYQ3BWZMC5D4ZUJX5NU4S7YZHC5EBFAFKL6UJUQ5RKDGSY"]
+    VERSION = "0.1.0"
+    SIGNING_KEY = "GDZCLP2PHTWYQ3BWZMC5D4ZUJX5NU4S7YZHC5EBFAFKL6UJUQ5RKDGSY"
+    NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+
+    WEB_AUTH_ENDPOINT = "https://anchor-dev.79.137.32.27.nip.io/auth"
+    WEB_AUTH_FOR_CONTRACTS_ENDPOINT = "https://anchor-dev.79.137.32.27.nip.io/sep45/auth"
+    WEB_AUTH_CONTRACT_ID = "CD3LA6RKF5D2FN2R2L57MWXLBRSEWWENE74YBEFZSSGNJRJGICFGQXMX"
+    KYC_SERVER = "https://anchor-dev.79.137.32.27.nip.io/sep12"
+    TRANSFER_SERVER = "https://anchor-dev.79.137.32.27.nip.io/sep6"
+    TRANSFER_SERVER_SEP0024 = "https://anchor-dev.79.137.32.27.nip.io/sep24"
+    DIRECT_PAYMENT_SERVER = "https://anchor-dev.79.137.32.27.nip.io/sep31"
+    ANCHOR_QUOTE_SERVER = "https://anchor-dev.79.137.32.27.nip.io/sep38"
+
+    [[CURRENCIES]]
+    code = "native"
+    status = "test"
+    is_asset_anchored = false
+    anchor_asset_type = "crypto"
+    desc = "XLM, the native token of the Stellar network."
+
+    [DOCUMENTATION]
+    ORG_NAME = "FatherPaul Payments"
+    ORG_URL = "https://fatherpaulai.com"
+    ORG_DESCRIPTION = "Cross-border payment experiments with Hyperswitch and Stellar."
+    ORG_SUPPORT_EMAIL = "support@fatherpaulai.com"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payments-frontend-html
+  namespace: payments-core
+data:
+  index.html: |
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <title>Payments Core</title>
+      <style>
+        body { font-family: system-ui, sans-serif; margin: 3rem; background: #f6f4ef; color: #112; }
+        .card { max-width: 860px; padding: 2rem; background: #fff; border-radius: 18px; box-shadow: 0 10px 30px rgba(0,0,0,.08); }
+        h1 { margin-top: 0; }
+        code { background: #f1efe7; padding: .15rem .35rem; border-radius: 6px; }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <h1>Payments Core</h1>
+        <p>This cluster hosts an isolated payments stack with Hyperswitch and Stellar Anchor.</p>
+        <ul>
+          <li>Frontend host: <code>pay-dev.79.137.32.27.nip.io</code></li>
+          <li>API host: <code>pay-api-dev.79.137.32.27.nip.io</code></li>
+          <li>Hyperswitch host: <code>switch-dev.79.137.32.27.nip.io</code></li>
+          <li>Stellar SEP host: <code>anchor-dev.79.137.32.27.nip.io</code></li>
+          <li>Stellar Reference host: <code>anchor-ref-dev.79.137.32.27.nip.io</code></li>
+        </ul>
+      </div>
+    </body>
+    </html>
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: payments-core
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-same-namespace
+  namespace: payments-core
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: payments-core
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: payments-core
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-public-http
+  namespace: payments-core
+spec:
+  podSelector:
+    matchExpressions:
+      - key: public-ingress
+        operator: In
+        values: ["true"]
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 8091
+        - protocol: TCP
+          port: 5678
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-acme-solver
+  namespace: payments-core
+spec:
+  podSelector:
+    matchLabels:
+      acme.cert-manager.io/http01-solver: "true"
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: TCP
+          port: 8089
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-dns-and-web
+  namespace: payments-core
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 443

@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: payments-core
+resources:
+  - 00-namespace.yaml
+  - 10-data.yaml
+  - 20-apps.yaml
+  - 30-ingress.yaml
+generatorOptions:
+  disableNameSuffixHash: true
+configMapGenerator:
+  - name: hyperswitch-config
+    files:
+      - docker_compose.toml=hyperswitch-docker_compose.toml

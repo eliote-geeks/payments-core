@@ -1,0 +1,441 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hyperswitch-migrations
+  namespace: payments-core
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hyperswitch-migrations
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migration-runner
+          image: debian:trixie-slim
+          command:
+            - bash
+            - -lc
+            - |
+              set -euo pipefail
+              apt-get update
+              apt-get install -y curl git xz-utils ca-certificates
+              git clone --depth 1 https://github.com/juspay/hyperswitch.git /tmp/hyperswitch
+              curl --proto '=https' --tlsv1.2 -LsSf https://github.com/diesel-rs/diesel/releases/download/v2.3.5/diesel_cli-installer.sh | bash
+              curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
+              export PATH="$PATH:$HOME/.cargo/bin"
+              export DATABASE_URL="postgresql://db_user:${HYPERSWITCH_DB_PASSWORD}@hyperswitch-postgres:5432/hyperswitch_db"
+              cd /tmp/hyperswitch
+              just migrate
+          env:
+            - name: HYPERSWITCH_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: payments-secrets
+                  key: HYPERSWITCH_DB_PASSWORD
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hyperswitch
+  namespace: payments-core
+spec:
+  selector:
+    app.kubernetes.io/name: hyperswitch
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hyperswitch
+  namespace: payments-core
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hyperswitch
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hyperswitch
+        public-ingress: "true"
+    spec:
+      containers:
+        - name: router
+          image: docker.juspay.io/juspaydotin/hyperswitch-router:standalone
+          command: ["./router", "-f", "/local/config/docker_compose.toml"]
+          ports:
+            - containerPort: 8080
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 300m
+              memory: 768Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: config
+              mountPath: /local/config/docker_compose.toml
+              subPath: docker_compose.toml
+      volumes:
+        - name: config
+          configMap:
+            name: hyperswitch-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stellar-platform
+  namespace: payments-core
+spec:
+  selector:
+    app.kubernetes.io/name: stellar-platform
+  ports:
+    - name: sep
+      port: 8080
+      targetPort: 8080
+    - name: platform
+      port: 8085
+      targetPort: 8085
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stellar-platform
+  namespace: payments-core
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: stellar-platform
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: stellar-platform
+        public-ingress: "true"
+    spec:
+      containers:
+        - name: platform
+          image: stellar/anchor-platform:2.11.2
+          args: ["--sep-server", "--platform-server", "--event-processor", "--stellar-observer"]
+          envFrom:
+            - configMapRef:
+                name: stellar-config
+            - secretRef:
+                name: payments-secrets
+          ports:
+            - containerPort: 8080
+              name: sep
+            - containerPort: 8085
+              name: platform
+          readinessProbe:
+            tcpSocket:
+              port: 8085
+            initialDelaySeconds: 90
+            periodSeconds: 20
+          livenessProbe:
+            tcpSocket:
+              port: 8085
+            initialDelaySeconds: 150
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: 1500m
+              memory: 2Gi
+          volumeMounts:
+            - name: config
+              mountPath: /config/assets.yaml
+              subPath: assets.yaml
+            - name: config
+              mountPath: /config/stellar.toml
+              subPath: stellar.toml
+      volumes:
+        - name: config
+          configMap:
+            name: stellar-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stellar-reference-server
+  namespace: payments-core
+spec:
+  selector:
+    app.kubernetes.io/name: stellar-reference-server
+  ports:
+    - name: http
+      port: 8091
+      targetPort: 8091
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stellar-reference-server
+  namespace: payments-core
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: stellar-reference-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: stellar-reference-server
+        public-ingress: "true"
+    spec:
+      containers:
+        - name: reference-server
+          image: stellar/anchor-platform:2.11.2
+          args: ["--kotlin-reference-server"]
+          env:
+            - name: KT_REFERENCE_SERVER_CONFIG
+              value: /config/reference-config.yaml
+          ports:
+            - containerPort: 8091
+              name: http
+          readinessProbe:
+            tcpSocket:
+              port: 8091
+            initialDelaySeconds: 45
+            periodSeconds: 20
+          livenessProbe:
+            tcpSocket:
+              port: 8091
+            initialDelaySeconds: 90
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 300m
+              memory: 512Mi
+            limits:
+              cpu: 750m
+              memory: 768Mi
+          volumeMounts:
+            - name: config
+              mountPath: /config/reference-config.yaml
+              subPath: reference-config.yaml
+      volumes:
+        - name: config
+          configMap:
+            name: stellar-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payments-api
+  namespace: payments-core
+spec:
+  selector:
+    app.kubernetes.io/name: payments-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payments-api
+  namespace: payments-core
+spec:
+  strategy:
+    type: Recreate
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: payments-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: payments-api
+        public-ingress: "true"
+    spec:
+      containers:
+        - name: api
+          image: payments-api:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PAYMENTS_API_DB_HOST
+              value: payments-api-postgres
+            - name: PAYMENTS_API_DB_PORT
+              value: "5432"
+            - name: PAYMENTS_API_DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: payments-secrets
+                  key: PAYMENTS_API_DB_USER
+            - name: PAYMENTS_API_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: payments-secrets
+                  key: PAYMENTS_API_DB_PASSWORD
+            - name: PAYMENTS_API_DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: payments-secrets
+                  key: PAYMENTS_API_DB_NAME
+            - name: HYPERSWITCH_BASE_URL
+              value: http://hyperswitch:8080
+            - name: STELLAR_SEP_BASE_URL
+              value: http://stellar-platform:8080
+            - name: ANCHOR_REF_BASE_URL
+              value: http://anchor-ref-health
+            - name: FX_API_BASE_URL
+              value: https://open.er-api.com/v6/latest
+          ports:
+            - containerPort: 8080
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 40
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 150m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 768Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payments-frontend
+  namespace: payments-core
+spec:
+  selector:
+    app.kubernetes.io/name: payments-frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payments-frontend
+  namespace: payments-core
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: payments-frontend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: payments-frontend
+        public-ingress: "true"
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 80
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          volumeMounts:
+            - name: html
+              mountPath: /usr/share/nginx/html/index.html
+              subPath: index.html
+      volumes:
+        - name: html
+          configMap:
+            name: payments-frontend-html
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: anchor-ref-health
+  namespace: payments-core
+spec:
+  selector:
+    app.kubernetes.io/name: anchor-ref-health
+  ports:
+    - name: http
+      port: 80
+      targetPort: 5678
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: anchor-ref-health
+  namespace: payments-core
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: anchor-ref-health
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: anchor-ref-health
+        public-ingress: "true"
+    spec:
+      containers:
+        - name: http-echo
+          image: hashicorp/http-echo:1.0.0
+          args:
+            - -listen=:5678
+            - -text={"status":"ok","service":"anchor-ref","path":"/healthz"}
+          ports:
+            - containerPort: 5678
+              name: http
+          readinessProbe:
+            tcpSocket:
+              port: 5678
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
