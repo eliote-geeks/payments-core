@@ -248,29 +248,6 @@ def init_db() -> None:
             )
             """
         )
-        # Safe evolution: add processing columns to webhook_events
-        cur.execute(
-            "ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ"
-        )
-        cur.execute(
-            "ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS processing_error TEXT"
-        )
-
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS trusted_devices (
-                id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                name TEXT NOT NULL,
-                ip_address TEXT,
-                fingerprint TEXT,
-                last_seen_at TIMESTAMPTZ,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            """
-        )
-        cur.execute("ALTER TABLE trusted_devices ADD COLUMN IF NOT EXISTS ip_address TEXT")
-
         cur.execute(
             """
             INSERT INTO pricing_rules (
@@ -288,76 +265,5 @@ def init_db() -> None:
             ON CONFLICT (source_currency, target_currency, destination_country, payout_method)
             DO NOTHING
             """
-        )
-
-
-
-        # Adresses wallet Kobo pour dépôts crypto
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS crypto_wallets (
-                id TEXT PRIMARY KEY,
-                network TEXT NOT NULL UNIQUE,
-                address TEXT NOT NULL,
-                label TEXT NOT NULL DEFAULT '',
-                explorer_url_prefix TEXT NOT NULL DEFAULT '',
-                active BOOLEAN NOT NULL DEFAULT TRUE,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """)
-        # Insérer l'adresse TRC20 par défaut si la table est vide
-        cur.execute("""
-            INSERT INTO crypto_wallets (id, network, address, label, explorer_url_prefix, active)
-            VALUES ('cw_trc20_default', 'TRC20', 'TQrZ9wBfXk8H2YpNmLkRsJv4cQxAeBcDfG', 'USDT TRC20', 'https://tronscan.org/#/transaction/', TRUE)
-            ON CONFLICT (network) DO NOTHING
-        """)
-
-        # Safe evolution: crypto withdrawals table
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS crypto_withdrawals (
-                id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL REFERENCES users(id),
-                amount_xaf NUMERIC(18,2) NOT NULL,
-                amount_usdt NUMERIC(18,6) NOT NULL,
-                network TEXT NOT NULL DEFAULT 'TRC20',
-                destination_address TEXT NOT NULL,
-                tx_hash TEXT,
-                status TEXT NOT NULL DEFAULT 'pending',
-                note TEXT NOT NULL DEFAULT '',
-                reject_reason TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """)
-        # Safe evolution: email columns for OTP-by-email
-        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT")
-        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_email_idx ON users(email) WHERE email IS NOT NULL")
-        cur.execute("ALTER TABLE otp_challenges ADD COLUMN IF NOT EXISTS email TEXT")
-        conn.commit()
-
-
-def init_crypto_schema() -> None:
-    """Migration pour les dépôts crypto manuels."""
-    with closing(get_conn()) as conn, conn.cursor() as cur:
-        cur.execute(
-            '''
-            CREATE TABLE IF NOT EXISTS crypto_deposits (
-                id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL REFERENCES users(id),
-                amount_xaf NUMERIC(18,2) NOT NULL,
-                amount_usdt NUMERIC(18,6) NOT NULL,
-                network TEXT NOT NULL DEFAULT \'TRC20\',
-                wallet_address TEXT NOT NULL,
-                tx_hash TEXT,
-                status TEXT NOT NULL DEFAULT \'pending\',
-                note TEXT NOT NULL DEFAULT \'\',
-                reject_reason TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            '''
-        )
-        cur.execute(
-            'CREATE UNIQUE INDEX IF NOT EXISTS crypto_deposits_tx_hash_idx ON crypto_deposits(tx_hash) WHERE tx_hash IS NOT NULL'
         )
         conn.commit()

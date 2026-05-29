@@ -5,7 +5,7 @@ from contextlib import closing
 from typing import Any
 
 import psycopg
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from psycopg.types.json import Json
 
 from app.core.time import utcnow
@@ -287,59 +287,3 @@ async def stellar_webhook(payload: dict[str, Any]) -> dict[str, Any]:
     event_id, _ = _store_event("stellar", payload)
     _process_stellar_event(event_id, payload)
     return {"status": "accepted", "event_id": event_id}
-
-
-# ── NotchPay webhook ──────────────────────────────────────────────────────────
-
-from fastapi import Request as _Request
-from app.services.notchpay import verify_webhook_signature as _verify_np
-
-
-@router.post("/notchpay")
-async def notchpay_webhook(request: _Request) -> dict:
-    """Reçoit les événements NotchPay (transfer.complete / transfer.failed)."""
-    body = await request.body()
-    signature = request.headers.get("x-notch-signature", "")
-    if not _verify_np(body, signature):
-        raise HTTPException(status_code=401, detail="Invalid NotchPay signature")
-
-    try:
-        data = await request.json()
-    except Exception:
-        return {"ok": True}
-
-    event = data.get("event", "")
-    transfer = data.get("transfer") or data.get("data") or {}
-    reference = transfer.get("reference") or ""
-
-    if not reference:
-        return {"ok": True}
-
-    with closing(get_conn()) as conn, conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-        cur.execute(
-            "SELECT * FROM wallet_transactions WHERE metadata->>'notchpay_ref' = %s",
-            (reference,),
-        )
-        tx = cur.fetchone()
-        if not tx:
-            return {"ok": True}
-
-        if event == "transfer.complete":
-            cur.execute(
-                "UPDATE wallet_transactions SET status='completed' WHERE id=%s",
-                (tx["id"],),
-            )
-        elif event == "transfer.failed":
-            cur.execute(
-                "UPDATE wallet_transactions SET status='failed' WHERE id=%s",
-                (tx["id"],),
-            )
-            # Rembourser le solde FCFA
-            cur.execute(
-                """UPDATE wallet_accounts SET balance = balance + %s, updated_at = NOW()
-                   WHERE user_id = %s AND currency = 'FCFA'""",
-                (tx["amount"], tx["user_id"]),
-            )
-        conn.commit()
-
-    return {"ok": True}

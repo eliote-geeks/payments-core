@@ -1,10 +1,9 @@
 from fastapi import FastAPI
 from starlette.middleware.cors import CORSMiddleware
 
-from app.db.schema import init_db, init_crypto_schema
+from app.db.schema import init_db
 from app.core.config import settings
 from app.routers import (
-    crypto,
     admin,
     auth,
     catalog,
@@ -34,7 +33,6 @@ app = FastAPI(
 
 @app.on_event("startup")
 def startup() -> None:
-    init_crypto_schema()
     init_db()
 
 
@@ -61,4 +59,3 @@ app.include_router(corridors.router)
 app.include_router(quotes.router)
 app.include_router(transfers.router)
 app.include_router(webhooks.router)
-app.include_router(crypto.router)
