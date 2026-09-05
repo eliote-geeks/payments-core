@@ -1,9 +1,5 @@
-from __future__ import annotations
-
 import uuid
 from contextlib import closing
-from decimal import Decimal
-from typing import Any
 
 import psycopg
 from fastapi import APIRouter, Depends, HTTPException
@@ -13,23 +9,16 @@ from app.core.security import AuthUser, require_user
 from app.core.time import utcnow
 from app.db.session import get_conn
 from app.models.schemas import TransferRequest
+from app.services.dependencies import payment_stack_dependencies
+from app.services.email import notify_admin
+from app.services.notifications import create_notification
 from app.services.serializers import serialize_transfer
+from app.services.compliance import enforce_compliance
 
 router = APIRouter(tags=["transfers"])
 
-_CANCELLABLE_STATUSES = {"pending_payment", "pending_settlement"}
 
-
-def _get_kobo_bank() -> dict[str, Any]:
-    with closing(get_conn()) as conn, conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-        cur.execute("SELECT value FROM app_settings WHERE key = 'kobo_bank'")
-        row = cur.fetchone()
-    if row:
-        return dict(row["value"])
-    return {"beneficiary": "KOBO ONLINE SAS", "iban": "", "bic": "", "bank": "Afriland First Bank"}
-
-
-def _build_step(name: str, status: str, detail: dict[str, Any]) -> dict[str, Any]:
+def build_step(name: str, status: str, detail: dict) -> dict:
     return {
         "step": name,
         "status": status,
@@ -38,205 +27,171 @@ def _build_step(name: str, status: str, detail: dict[str, Any]) -> dict[str, Any
     }
 
 
-def _append_step(conn: Any, transfer_id: str, step: dict[str, Any]) -> None:
-    conn.cursor().execute(
-        """
-        UPDATE transfers
-        SET orchestration = orchestration || %s::jsonb,
-            updated_at    = %s
-        WHERE id = %s
-        """,
-        (Json([step]), utcnow(), transfer_id),
-    )
-
-
-def _update_transfer(
-    conn: Any,
-    transfer_id: str,
-    *,
-    payment_status: str | None = None,
-    settlement_status: str | None = None,
-    status: str | None = None,
-    funding_reference: str | None = None,
-    settlement_reference: str | None = None,
-) -> None:
-    fields: list[str] = ["updated_at = %s"]
-    values: list[Any] = [utcnow()]
-    if payment_status is not None:
-        fields.append("payment_status = %s")
-        values.append(payment_status)
-    if settlement_status is not None:
-        fields.append("settlement_status = %s")
-        values.append(settlement_status)
-    if status is not None:
-        fields.append("status = %s")
-        values.append(status)
-    if funding_reference is not None:
-        fields.append("funding_reference = %s")
-        values.append(funding_reference)
-    if settlement_reference is not None:
-        fields.append("settlement_reference = %s")
-        values.append(settlement_reference)
-    values.append(transfer_id)
-    conn.cursor().execute(
-        f"UPDATE transfers SET {', '.join(fields)} WHERE id = %s", values
-    )
-
-
 @router.post("/transfers")
 async def create_transfer(
     request: TransferRequest,
     user: AuthUser = Depends(require_user),
-) -> dict[str, Any]:
+) -> dict:
     with closing(get_conn()) as conn, conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
         cur.execute("SELECT * FROM quotes WHERE id = %s", (request.quote_id,))
         quote = cur.fetchone()
     if not quote:
-        raise HTTPException(status_code=404, detail="Quote introuvable")
+        raise HTTPException(status_code=404, detail="Quote not found")
     if quote["expires_at"] <= utcnow():
-        raise HTTPException(status_code=400, detail="Devis expiré — veuillez en créer un nouveau")
+        raise HTTPException(status_code=400, detail="Quote expired")
+    compliance_amount_fcfa = quote["target_amount"] if quote["target_currency"] in ("XAF", "FCFA") else quote["source_amount"]
+    enforce_compliance(user_id=user.id, amount_fcfa=compliance_amount_fcfa, flow="intl", allow_manual_review=True)
+    enforce_compliance(
+        user_id=user.id,
+        amount_fcfa=compliance_amount_fcfa,
+        flow="intl",
+        allow_manual_review=True,
+        country_override=quote["destination_country"],
+    )
 
-    source_currency = quote["source_currency"]
-    is_xaf_source = source_currency == "XAF"
+    dependencies = await payment_stack_dependencies()
+
     transfer_id = f"tr_{uuid.uuid4().hex[:16]}"
+    funding_reference = f"fund_{uuid.uuid4().hex[:12]}"
+    settlement_reference = f"stl_{uuid.uuid4().hex[:12]}"
 
-    # ── XAF → EUR/USD : débit immédiat du solde FCFA ─────────────────────────
-    if is_xaf_source:
-        total_debit = Decimal(str(quote["source_amount"]))
-        with closing(get_conn()) as conn, conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-            cur.execute(
-                "SELECT balance FROM wallet_accounts WHERE user_id = %s AND currency = 'FCFA'",
-                (user.id,),
-            )
-            bal_row = cur.fetchone()
-            balance = Decimal(str(bal_row["balance"])) if bal_row else Decimal("0")
-            if balance < total_debit:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Solde insuffisant ({float(balance):,.0f} FCFA disponible)",
-                )
-            cur.execute(
-                "UPDATE wallet_accounts SET balance = balance - %s, updated_at = %s WHERE user_id = %s AND currency = 'FCFA'",
-                (total_debit, utcnow(), user.id),
-            )
-            conn.commit()
+    orchestration = [
+        build_step("quote_validated", "ok", {"quote_id": request.quote_id}),
+        build_step(
+            "funding_stack_checked",
+            "ok" if dependencies["hyperswitch"]["ok"] else "degraded",
+            dependencies["hyperswitch"],
+        ),
+        build_step(
+            "settlement_stack_checked",
+            "ok" if dependencies["stellar_sep"]["ok"] else "degraded",
+            dependencies["stellar_sep"],
+        ),
+        build_step(
+            "anchor_reference_checked",
+            "ok" if dependencies["anchor_ref"]["ok"] else "degraded",
+            dependencies["anchor_ref"],
+        ),
+        build_step(
+            "funding_intent_prepared",
+            "ok",
+            {
+                "reference": funding_reference,
+                "funding_method": request.funding_method,
+            },
+        ),
+        build_step(
+            "settlement_intent_prepared",
+            "ok",
+            {
+                "reference": settlement_reference,
+                "rail": "stellar",
+                "target_currency": quote["target_currency"],
+            },
+        ),
+    ]
 
-        payment_status = "paid"
-        settlement_status = "pending_settlement"
-        status = "pending_settlement"
-        payment_instructions = None
-        orchestration = [
-            _build_step("quote_validated", "ok", {"quote_id": request.quote_id}),
-            _build_step("balance_debited", "ok", {
-                "amount": float(total_debit),
-                "currency": "FCFA",
-                "user_id": user.id,
-            }),
-        ]
-
-    # ── EUR/USD/GBP → XAF : instructions de paiement bancaire ───────────────
-    else:
-        payment_status = "pending_payment"
-        settlement_status = "pending_credit"
-        status = "pending_payment"
-        payment_instructions = {
-            **_get_kobo_bank(),
-            "amount": float(quote["source_amount"]),
-            "currency": source_currency,
-            "reference": transfer_id,
-            "note": f"Après réception, le destinataire recevra {float(quote['target_amount']):,.0f} FCFA sur son Mobile Money ou compte bancaire sous 24h.",
-        }
-        orchestration = [
-            _build_step("quote_validated", "ok", {"quote_id": request.quote_id}),
-            _build_step("payment_instructions_sent", "ok", {"method": "bank_transfer"}),
-        ]
-
-    sender_data = {**dict(request.sender), "user_id": user.id}
-
+    # All intl transfers start pending_payment — admin confirms receipt
     with closing(get_conn()) as conn, conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
         cur.execute(
             """
             INSERT INTO transfers (
-                id, quote_id, source_currency, target_currency,
-                source_amount, target_amount, fees_amount,
-                sender, recipient, funding_method,
-                payment_status, settlement_status, status,
-                orchestration, dependencies, user_id
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                id, quote_id, user_id, source_currency, target_currency, source_amount, target_amount,
+                fees_amount, sender, recipient, funding_method, payment_status,
+                settlement_status, status, orchestration, dependencies,
+                funding_reference, settlement_reference
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING *
             """,
             (
                 transfer_id,
                 request.quote_id,
-                source_currency,
+                user.id,
+                quote["source_currency"],
                 quote["target_currency"],
                 quote["source_amount"],
                 quote["target_amount"],
                 quote["fees_amount"],
-                Json(sender_data),
-                Json(dict(request.recipient)),
+                Json({**request.sender, "user_id": user.id}),
+                Json(request.recipient),
                 request.funding_method,
-                payment_status,
-                settlement_status,
-                status,
+                "pending_payment",
+                "pending_settlement",
+                "pending_payment",
                 Json(orchestration),
-                Json({}),
-                user.id,
+                Json(dependencies),
+                funding_reference,
+                settlement_reference,
             ),
         )
         row = cur.fetchone()
         conn.commit()
 
-    result = serialize_transfer(row)
-    if payment_instructions:
-        result["payment_instructions"] = payment_instructions
-    return result
+    src_amount = float(quote["source_amount"])
+    tgt_amount = float(quote["target_amount"])
+    src_cur = quote["source_currency"]
+    tgt_cur = quote["target_currency"]
+    recipient_name = (request.recipient or {}).get("name", "—")
+    recipient_phone = (request.recipient or {}).get("phone", "—")
+    method_label = "USDT (TRC-20)" if request.funding_method == "usdt" else "Virement bancaire"
 
+    # Notification in-app utilisateur
+    try:
+        create_notification(
+            user_id=user.id,
+            notif_type="intl_transfer_created",
+            title="Transfert international initié",
+            body=(
+                f"Votre transfert de {src_amount:,.2f} {src_cur} vers {recipient_name} "
+                f"({tgt_amount:,.0f} {tgt_cur}) a bien été enregistré. "
+                f"Envoyez votre paiement via {method_label} pour finaliser."
+            ),
+            metadata={"transfer_id": transfer_id},
+        )
+    except Exception:
+        pass
 
-@router.get("/transfers/{transfer_id}")
-async def get_transfer(
-    transfer_id: str,
-    user: AuthUser = Depends(require_user),
-) -> dict[str, Any]:
-    with closing(get_conn()) as conn, conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-        cur.execute("SELECT * FROM transfers WHERE id = %s", (transfer_id,))
-        row = cur.fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="Transfer not found")
+    # Email admin
+    try:
+        notify_admin(
+            f"Nouveau transfert international — {src_amount:,.2f} {src_cur} → {tgt_amount:,.0f} {tgt_cur}",
+            f"<b>Référence :</b> {transfer_id}<br>"
+            f"<b>Utilisateur :</b> {user.id}<br>"
+            f"<b>Expéditeur :</b> {(request.sender or {}).get('name', '—')} — {(request.sender or {}).get('phone', '—')}<br>"
+            f"<b>Destinataire :</b> {recipient_name} — {recipient_phone}<br>"
+            f"<b>Montant :</b> {src_amount:,.2f} {src_cur} → {tgt_amount:,.0f} {tgt_cur}<br>"
+            f"<b>Frais :</b> {float(quote['fees_amount']):,.2f} {src_cur}<br>"
+            f"<b>Méthode de paiement :</b> {method_label}<br><br>"
+            f"<b>Action requise :</b> Vérifiez la réception du paiement et confirmez dans le panel admin.",
+        )
+    except Exception:
+        pass
+
     return serialize_transfer(row)
 
 
-@router.post("/transfers/{transfer_id}/cancel")
-async def cancel_transfer(
-    transfer_id: str,
+@router.get("/transfers/me/pending")
+async def get_my_pending_transfer(
     user: AuthUser = Depends(require_user),
-) -> dict[str, Any]:
+) -> dict:
+    """Retourne le dernier transfert international non finalisé de l'utilisateur (s'il existe)."""
     with closing(get_conn()) as conn, conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-        cur.execute("SELECT * FROM transfers WHERE id = %s AND user_id = %s", (transfer_id, user.id))
+        cur.execute(
+            """SELECT * FROM transfers
+               WHERE user_id = %s
+                 AND status NOT IN ('completed', 'failed', 'cancelled', 'rejected')
+               ORDER BY created_at DESC LIMIT 1""",
+            (user.id,),
+        )
+        row = cur.fetchone()
+    return {"pending": serialize_transfer(row) if row else None}
+
+
+@router.get("/transfers/{transfer_id}")
+async def get_transfer(transfer_id: str) -> dict:
+    with closing(get_conn()) as conn, conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+        cur.execute("SELECT * FROM transfers WHERE id = %s", (transfer_id,))
         row = cur.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Transfer not found")
-    if row["status"] not in _CANCELLABLE_STATUSES:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Impossible d'annuler un transfert en statut '{row['status']}'",
-        )
-
-    # Rembourser si FCFA déjà débité
-    if row["source_currency"] == "XAF" and row["payment_status"] == "paid":
-        with closing(get_conn()) as conn, conn.cursor() as cur:
-            cur.execute(
-                "UPDATE wallet_accounts SET balance = balance + %s, updated_at = %s WHERE user_id = %s AND currency = 'FCFA'",
-                (row["source_amount"], utcnow(), user.id),
-            )
-            conn.commit()
-
-    step = _build_step("cancelled_by_user", "ok", {"user_id": user.id})
-    with closing(get_conn()) as conn, conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-        _update_transfer(conn, transfer_id, status="cancelled", payment_status="cancelled")
-        _append_step(conn, transfer_id, step)
-        conn.commit()
-        cur.execute("SELECT * FROM transfers WHERE id = %s", (transfer_id,))
-        row = cur.fetchone()
-
     return serialize_transfer(row)

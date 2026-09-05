@@ -6,6 +6,7 @@ resources:
   - 10-data.yaml
   - 20-apps.yaml
   - 30-ingress.yaml
+  - 90-secure-live-deployments.json
 generatorOptions:
   disableNameSuffixHash: true
 configMapGenerator:

@@ -8,6 +8,7 @@ from app.services.support import (
     add_agent_message,
     add_user_message,
     create_ticket,
+    create_unblock_appeal,
     list_chat,
     list_faq,
     list_tickets,
@@ -66,16 +67,22 @@ async def chat(user: AuthUser = Depends(require_user)) -> dict:
 
 @router.post("/chat")
 async def chat_send(req: ChatSendRequest, user: AuthUser = Depends(require_user)) -> dict:
-    user_row = add_user_message(user.id, req.text)
-    # MVP: auto-ack by agent (real flow will be ticket routing + operators)
-    agent_row = add_agent_message(
-        user.id,
-        "Merci, je vérifie et je reviens vers vous.",
-        author_name="Yasmine (Support)",
-    )
+    add_user_message(user.id, req.text)
     return {"ok": True}
 
 
 @router.get("/faq")
 async def faq() -> dict:
     return {"items": list_faq()}
+
+
+class UnblockAppealRequest(BaseModel):
+    email: str = Field(min_length=5, max_length=254)
+    message: str = Field(min_length=10, max_length=2000)
+
+
+@router.post("/appeal")
+async def submit_unblock_appeal(req: UnblockAppealRequest) -> dict:
+    """Endpoint public — pas d'auth requise. Permet à un compte bloqué de soumettre une demande de déblocage."""
+    ref = create_unblock_appeal(email=req.email.lower().strip(), message=req.message)
+    return {"ok": True, "reference": ref}

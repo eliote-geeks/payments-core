@@ -34,8 +34,12 @@ async def create_quote(request: QuoteRequest) -> dict:
     amounts = calculate_quote_amounts(source_amount, pricing_rule, fx_rate)
     quote_id = f"qt_{uuid.uuid4().hex[:16]}"
     expires_at = utcnow() + timedelta(minutes=settings.quote_ttl_minutes)
+    effective_rate = amounts.get("effective_fx_rate", fx_rate)
+    spread_rate = amounts.get("spread_rate", Decimal("0"))
     metadata = {
         "pricing_rule": pricing_rule,
+        "raw_fx_rate": float(fx_rate),
+        "spread_rate": float(spread_rate),
         "fee_breakdown": {
             "fixed_fee": float(amounts["fixed_fee"]),
             "variable_fee": float(quantize_money(amounts["variable_fee"])),
@@ -58,7 +62,7 @@ async def create_quote(request: QuoteRequest) -> dict:
                 request.target_currency,
                 source_amount,
                 amounts["fees"],
-                fx_rate,
+                effective_rate,  # on stocke le taux effectif (après spread)
                 amounts["target_amount"],
                 request.destination_country,
                 request.payout_method,

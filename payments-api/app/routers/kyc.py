@@ -4,10 +4,23 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from app.core.security import AuthUser, require_user
+from app.services.email import notify_admin
 from app.services.kyc import get_kyc, limits_for, reset_kyc, set_document_pending, store_document_upload
-from app.services.users import update_user_profile
+from app.services.users import get_user, update_user_profile
 
 router = APIRouter(prefix="/kyc", tags=["kyc"])
+
+
+def _detect_document_type(content: bytes) -> tuple[str, str] | None:
+    if content.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg", ".jpg"
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png", ".png"
+    if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "image/webp", ".webp"
+    if content.startswith(b"%PDF-"):
+        return "application/pdf", ".pdf"
+    return None
 
 
 class KycUploadRequest(BaseModel):
@@ -60,11 +73,15 @@ async def upload_file(
         raise HTTPException(status_code=400, detail="Empty file")
     if len(content) > 8 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="File too large")
+    detected = _detect_document_type(content)
+    if detected is None:
+        raise HTTPException(status_code=415, detail="Format non supporté (JPEG, PNG, WebP ou PDF)")
+    content_type, extension = detected
     store_document_upload(
         user_id=user.id,
         doc_key=doc_key,
-        file_name=file.filename or f"{doc_key}.bin",
-        content_type=file.content_type or "application/octet-stream",
+        file_name=f"{doc_key}{extension}",
+        content_type=content_type,
         content=content,
     )
     return {"ok": True}
@@ -100,4 +117,14 @@ async def submit(user: AuthUser = Depends(require_user)) -> dict:
             (utcnow(), user.id),
         )
         conn.commit()
+
+    user_row = get_user(user.id)
+    user_email = (user_row or {}).get("email") or user.id
+    notify_admin(
+        "📋 Nouveau dossier KYC soumis",
+        f"<b>Utilisateur :</b> {user_email}<br>"
+        f"<b>ID :</b> {user.id}<br>"
+        f"<b>Action :</b> Dossier KYC soumis et en attente de validation.<br><br>"
+        f"Rendez-vous sur le panel admin pour valider ou rejeter le dossier.",
+    )
     return {"ok": True}

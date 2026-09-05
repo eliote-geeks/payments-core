@@ -21,12 +21,8 @@ def get_user_by_phone(phone_e164: str) -> dict[str, Any] | None:
 
 
 def get_user_by_email(email: str) -> dict[str, Any] | None:
-    email = email.lower().strip()
     with closing(get_conn()) as conn, conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-        cur.execute(
-            "SELECT * FROM users WHERE email = %s OR phone_e164 = %s",
-            (email, email),
-        )
+        cur.execute("SELECT * FROM users WHERE email = %s", (email,))
         return cur.fetchone()
 
 
@@ -36,7 +32,7 @@ def get_user(user_id: str) -> dict[str, Any] | None:
         return cur.fetchone()
 
 
-def create_user(*, user_id: str, phone_e164: str, email: str | None = None, profile: dict[str, Any]) -> dict[str, Any]:
+def create_user(*, user_id: str, phone_e164: str, profile: dict[str, Any], email: str | None = None) -> dict[str, Any]:
     with closing(get_conn()) as conn, conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
         cur.execute(
             """
@@ -59,15 +55,32 @@ def update_user_profile(*, user_id: str, patch: dict[str, Any]) -> dict[str, Any
             raise ValueError("User not found")
         current = row["profile"] or {}
         current.update(patch)
-        cur.execute(
-            """
-            UPDATE users
-            SET profile = %s, updated_at = %s
-            WHERE id = %s
-            RETURNING *
-            """,
-            (Json(current), utcnow(), user_id),
-        )
+        # Sync dedicated columns alongside the JSONB profile
+        email = patch.get("email")
+        recovery_phone = patch.get("recoveryPhone") or patch.get("recovery_phone")
+        if email and recovery_phone:
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_phone TEXT")
+            cur.execute(
+                "UPDATE users SET profile=%s, email=%s, recovery_phone=%s, updated_at=%s WHERE id=%s RETURNING *",
+                (Json(current), email, recovery_phone, utcnow(), user_id),
+            )
+        elif email:
+            cur.execute(
+                "UPDATE users SET profile=%s, email=%s, updated_at=%s WHERE id=%s RETURNING *",
+                (Json(current), email, utcnow(), user_id),
+            )
+        elif recovery_phone:
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_phone TEXT")
+            cur.execute(
+                "UPDATE users SET profile=%s, recovery_phone=%s, updated_at=%s WHERE id=%s RETURNING *",
+                (Json(current), recovery_phone, utcnow(), user_id),
+            )
+        else:
+            cur.execute(
+                "UPDATE users SET profile=%s, updated_at=%s WHERE id=%s RETURNING *",
+                (Json(current), utcnow(), user_id),
+            )
         out = cur.fetchone()
         conn.commit()
     return out
+

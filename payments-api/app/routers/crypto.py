@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import uuid
 from contextlib import closing
 from decimal import Decimal, ROUND_UP
@@ -14,6 +16,12 @@ from app.core.config import settings
 from app.core.security import AuthUser, require_user
 from app.core.time import utcnow
 from app.db.session import get_conn
+from app.services.blockchain_verify import verify_tx
+from app.services.compliance import enforce_compliance
+from app.services.fees import get_min_amount_fcfa
+from app.services.notifications import create_notification
+from app.services.pin_security import verify_user_pin
+from app.services.users import get_user
 from app.services.wallets import append_transaction
 
 router = APIRouter(prefix="/crypto", tags=["crypto"])
@@ -52,6 +60,14 @@ def xaf_to_usdt(amount_xaf: Decimal) -> Decimal:
     return (amount_xaf / XAF_PER_USDT).quantize(Decimal("0.01"), rounding=ROUND_UP)
 
 
+def _hash_pin(pin: str) -> str:
+    return hashlib.sha256(pin.encode()).hexdigest()
+
+
+def _verify_user_pin(user_id: str, pin: str | None) -> None:
+    verify_user_pin(user_id, pin, purpose="crypto_withdrawal")
+
+
 # ── Schemas ───────────────────────────────────────────────────────────────────
 
 class DepositInitRequest(BaseModel):
@@ -71,8 +87,12 @@ async def init_deposit(
     req: DepositInitRequest,
     user: AuthUser = Depends(require_user),
 ) -> dict[str, Any]:
-    """Initie un dépôt crypto manuel. Retourne l'adresse et le montant USDT à envoyer."""
+    """Initie un dépôt crypto. Le scanner blockchain crédite automatiquement après confirmations."""
     network = (req.network or "TRC20").upper()
+    min_amount = get_min_amount_fcfa("crypto_deposit_usdt", 100)
+    if req.amount_xaf < min_amount:
+        raise HTTPException(status_code=400, detail=f"Montant minimum : {int(min_amount)} FCFA")
+    enforce_compliance(user_id=user.id, amount_fcfa=req.amount_xaf, flow="crypto", allow_manual_review=True)
     wallet = get_wallet(network)
     amount_usdt = xaf_to_usdt(req.amount_xaf)
     deposit_id = f"cdep_{uuid.uuid4().hex[:16]}"
@@ -91,6 +111,16 @@ async def init_deposit(
         )
         conn.commit()
 
+    create_notification(
+        user.id,
+        "crypto_deposit_started",
+        "Dépôt crypto initié",
+        (
+            f"Votre dépôt crypto de {float(req.amount_xaf):,.0f} FCFA est en attente. "
+            f"Envoyez exactement {amount_usdt} USDT sur le réseau {network}. Kobo vérifiera automatiquement la blockchain."
+        ),
+        {"deposit_id": deposit_id, "network": network, "amount_usdt": float(amount_usdt)},
+    )
     return {
         "deposit_id": deposit_id,
         "status": "pending",
@@ -102,7 +132,7 @@ async def init_deposit(
         "rate": float(XAF_PER_USDT),
         "instructions": (
             f"Envoie exactement {amount_usdt} USDT (réseau {network}) "
-            f"à l'adresse {wallet['address']}, puis soumets le hash de ta transaction."
+            f"à l'adresse {wallet['address']}. Le crédit est automatique après confirmations ; le hash reste un recours si le scan ne rapproche pas le paiement."
         ),
         "explorer": wallet.get("explorer_url_prefix") or EXPLORERS.get(network, ""),
     }
@@ -114,7 +144,14 @@ async def submit_hash(
     req: SubmitHashRequest,
     user: AuthUser = Depends(require_user),
 ) -> dict[str, Any]:
-    """L'utilisateur soumet le hash de sa transaction après envoi."""
+    """
+    L'utilisateur soumet le hash de sa transaction.
+    Lance la vérification automatique via l'explorateur blockchain :
+      - auto_confirmed  : tx valide + ≥20 confirmations → crédite immédiatement
+      - hash_verified   : tx valide mais pas encore assez de confirmations → admin one-click
+      - needs_manual_review : API indisponible ou réseau non supporté → revue admin
+      - invalid         : hash faux/montant incorrect → rejet immédiat
+    """
     with closing(get_conn()) as conn, conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
         cur.execute(
             "SELECT * FROM crypto_deposits WHERE id = %s AND user_id = %s",
@@ -123,38 +160,134 @@ async def submit_hash(
         dep = cur.fetchone()
         if not dep:
             raise HTTPException(status_code=404, detail="Dépôt introuvable")
-        if dep["status"] != "pending":
-            raise HTTPException(
-                status_code=409,
-                detail=f"Ce dépôt est déjà en statut '{dep['status']}'",
-            )
-        # Vérifier qu'un hash n'est pas déjà utilisé
+        if dep["status"] not in ("pending",):
+            raise HTTPException(status_code=409, detail=f"Ce dépôt est déjà en statut '{dep['status']}'")
+
         cur.execute(
             "SELECT id FROM crypto_deposits WHERE tx_hash = %s AND id != %s",
             (req.tx_hash, deposit_id),
         )
         if cur.fetchone():
-            raise HTTPException(status_code=409, detail="Ce hash est déjà utilisé pour un autre dépôt")
+            raise HTTPException(status_code=409, detail="Ce hash est déjà associé à un autre dépôt")
 
-        cur.execute(
-            """
-            UPDATE crypto_deposits
-            SET tx_hash = %s, status = 'submitted', updated_at = %s
-            WHERE id = %s
-            """,
-            (req.tx_hash, utcnow(), deposit_id),
-        )
-        conn.commit()
+    # ── Blockchain verification ───────────────────────────────────────────────
+    result = verify_tx(
+        tx_hash=req.tx_hash,
+        network=dep["network"],
+        expected_to=dep["wallet_address"],
+        expected_usdt=Decimal(str(dep["amount_usdt"])),
+    )
 
+    if result.status == "invalid":
+        raise HTTPException(status_code=400, detail=result.reason or "Hash de transaction invalide")
+
+    now = utcnow()
     network = dep["network"]
     explorer_url = EXPLORERS.get(network, "") + req.tx_hash
 
+    # ── Auto-confirm: credit immediately ─────────────────────────────────────
+    if result.status == "auto_confirmed":
+        amount_xaf = Decimal(str(dep["amount_xaf"]))
+        tx_id = f"tx_{uuid.uuid4().hex[:16]}"
+        with closing(get_conn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                """UPDATE crypto_deposits
+                   SET tx_hash=%s, status='auto_confirmed',
+                       verification_status='auto_confirmed',
+                       verification_confirmations=%s, updated_at=%s
+                   WHERE id=%s""",
+                (req.tx_hash, result.confirmations, now, deposit_id),
+            )
+            cur.execute(
+                """INSERT INTO wallet_accounts (user_id, currency, balance, address, metadata, created_at, updated_at)
+                   VALUES (%s,'FCFA',%s,NULL,'{}'::jsonb,%s,%s)
+                   ON CONFLICT (user_id, currency)
+                   DO UPDATE SET balance = wallet_accounts.balance + EXCLUDED.balance, updated_at = EXCLUDED.updated_at""",
+                (user.id, amount_xaf, now, now),
+            )
+            cur.execute(
+                """INSERT INTO wallet_transactions
+                   (id,user_id,direction,category,label,counterpart,amount,currency,status,metadata,created_at)
+                   VALUES (%s,%s,'credit','crypto_deposit','Dépôt crypto USDT',%s,%s,'FCFA','completed',%s,NOW())""",
+                (tx_id, user.id, network,
+                 amount_xaf,
+                 Json({"deposit_id": deposit_id, "tx_hash": req.tx_hash,
+                       "network": network, "amount_usdt": float(result.amount_usdt or 0),
+                       "confirmations": result.confirmations})),
+            )
+            conn.commit()
+        try:
+            create_notification(
+                user.id, "deposit_confirmed",
+                "Dépôt confirmé ✅",
+                f"Votre dépôt de {float(dep['amount_xaf']):,.0f} FCFA a été crédité automatiquement.",
+                {"deposit_id": deposit_id, "amount_xaf": float(dep["amount_xaf"]),
+                 "amount_usdt": float(result.amount_usdt or 0)},
+            )
+        except Exception:
+            pass
+
+        return {
+            "deposit_id": deposit_id,
+            "status": "auto_confirmed",
+            "verified": True,
+            "confirmations": result.confirmations,
+            "amount_usdt": float(result.amount_usdt or dep["amount_usdt"]),
+            "amount_xaf": float(dep["amount_xaf"]),
+            "tx_hash": req.tx_hash,
+            "explorer_url": explorer_url,
+            "message": f"Transaction vérifiée ({result.confirmations} confirmations). Votre compte a été crédité de {float(dep['amount_xaf']):,.0f} FCFA.",
+        }
+
+    # ── Hash verified but not enough confirmations ────────────────────────────
+    if result.status == "hash_verified":
+        with closing(get_conn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                """UPDATE crypto_deposits
+                   SET tx_hash=%s, status='hash_verified',
+                       verification_status='hash_verified',
+                       verification_confirmations=%s, updated_at=%s
+                   WHERE id=%s""",
+                (req.tx_hash, result.confirmations, now, deposit_id),
+            )
+            conn.commit()
+        create_notification(
+            user.id,
+            "crypto_deposit_verified",
+            "Hash crypto vérifié",
+            (
+                f"Votre transaction crypto est valide avec {result.confirmations} confirmations. "
+                "Le solde sera crédité automatiquement dès que le seuil de confirmations sera atteint."
+            ),
+            {"deposit_id": deposit_id, "tx_hash": req.tx_hash, "confirmations": result.confirmations},
+        )
+        return {
+            "deposit_id": deposit_id,
+            "status": "hash_verified",
+            "verified": True,
+            "confirmations": result.confirmations,
+            "tx_hash": req.tx_hash,
+            "explorer_url": explorer_url,
+            "message": f"Transaction valide ({result.confirmations}/{20} confirmations). Crédit automatique dès confirmation complète.",
+        }
+
+    # ── Manual review fallback ────────────────────────────────────────────────
+    with closing(get_conn()) as conn, conn.cursor() as cur:
+        cur.execute(
+            """UPDATE crypto_deposits
+               SET tx_hash=%s, status='submitted',
+                   verification_status='needs_manual_review', updated_at=%s
+               WHERE id=%s""",
+            (req.tx_hash, now, deposit_id),
+        )
+        conn.commit()
     return {
         "deposit_id": deposit_id,
         "status": "submitted",
+        "verified": False,
         "tx_hash": req.tx_hash,
         "explorer_url": explorer_url,
-        "message": "Transaction soumise. Un admin va vérifier et créditer ton compte sous peu.",
+        "message": f"Hash soumis. {result.reason} — un admin va vérifier sous peu.",
     }
 
 
@@ -250,6 +383,7 @@ class WithdrawInitRequest(BaseModel):
     destination_address: str = Field(min_length=20, max_length=128, description="Adresse USDT de destination")
     network: str = Field(default="TRC20", description="Réseau blockchain")
     note: str | None = Field(default=None, max_length=240)
+    pin: str | None = Field(default=None, min_length=4, max_length=8)
 
 
 @router.post("/withdraw/init")
@@ -258,13 +392,18 @@ async def init_withdrawal(
     user: AuthUser = Depends(require_user),
 ) -> dict[str, Any]:
     """Initie un retrait crypto. Débite immédiatement le solde FCFA."""
+    _verify_user_pin(user.id, req.pin)
+    min_amount = get_min_amount_fcfa("crypto_withdrawal_usdt", 100)
+    if req.amount_xaf < min_amount:
+        raise HTTPException(status_code=400, detail=f"Montant minimum : {int(min_amount)} FCFA")
+    enforce_compliance(user_id=user.id, amount_fcfa=req.amount_xaf, flow="crypto", allow_manual_review=True)
     amount_usdt = xaf_to_usdt(req.amount_xaf)
     withdrawal_id = f"cwit_{uuid.uuid4().hex[:16]}"
 
     with closing(get_conn()) as conn, conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
         # Vérifier le solde FCFA
         cur.execute(
-            "SELECT balance FROM wallet_accounts WHERE user_id = %s AND currency = 'FCFA'",
+            "SELECT balance FROM wallet_accounts WHERE user_id = %s AND currency = 'FCFA' FOR UPDATE",
             (user.id,),
         )
         row = cur.fetchone()

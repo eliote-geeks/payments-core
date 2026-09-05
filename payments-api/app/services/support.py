@@ -10,6 +10,7 @@ from psycopg.types.json import Json
 
 from app.core.serialization import json_ready
 from app.db.session import get_conn
+from app.services.users import get_user_by_email
 
 
 def utcnow() -> datetime:
@@ -99,6 +100,36 @@ def add_agent_message(user_id: str, body: str, author_name: str = "Support") -> 
         row = cur.fetchone()
         conn.commit()
     return row
+
+
+def create_unblock_appeal(email: str, message: str) -> str:
+    """Crée un ticket de demande de déblocage pour un compte bloqué (sans auth).
+    Retourne la référence du ticket (ex: tck_abc123).
+    Si l'email est inconnu, on crée quand même un enregistrement pour traçabilité."""
+    user = get_user_by_email(email)
+    user_id = user["id"] if user else f"anon_{uuid.uuid4().hex[:12]}"
+
+    ticket_id = f"tck_{uuid.uuid4().hex[:12]}"
+    subject = "Demande de déblocage de compte"
+    body = f"Email: {email}\n\n{message}"
+
+    with closing(get_conn()) as conn, conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+        cur.execute(
+            """
+            INSERT INTO support_tickets (id, user_id, subject, status, created_at, updated_at)
+            VALUES (%s,%s,%s,'open',%s,%s)
+            """,
+            (ticket_id, user_id, subject, utcnow(), utcnow()),
+        )
+        cur.execute(
+            """
+            INSERT INTO support_messages (id, user_id, from_role, author_name, body, created_at)
+            VALUES (%s,%s,'user',NULL,%s,%s)
+            """,
+            (f"msg_{uuid.uuid4().hex[:14]}", user_id, body, utcnow()),
+        )
+        conn.commit()
+    return ticket_id
 
 
 def seed_faq() -> None:

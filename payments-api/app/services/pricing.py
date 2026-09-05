@@ -50,6 +50,20 @@ async def get_live_fx_rate(
         return fallback_rates[fallback_key], f"{provider}:fallback", utcnow()
 
 
+def get_intl_spread() -> Decimal:
+    """Retourne le spread intl configuré dans app_settings.fees (défaut 0%)."""
+    try:
+        with closing(get_conn()) as conn, conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+            cur.execute("SELECT value FROM app_settings WHERE key = 'fees' LIMIT 1")
+            row = cur.fetchone()
+        if row and row["value"] and "intl_transfer_spread" in row["value"]:
+            rate = row["value"]["intl_transfer_spread"].get("rate", 0)
+            return Decimal(str(rate)) / Decimal("100")
+    except Exception:
+        pass
+    return Decimal("0")
+
+
 def get_pricing_rule(request: QuoteRequest) -> dict[str, Any]:
     with closing(get_conn()) as conn, conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
         cur.execute(
@@ -86,7 +100,12 @@ def calculate_quote_amounts(
     variable_fee = (source_amount * Decimal(pricing_rule["variable_fee_bps"])) / Decimal("10000")
     min_fee = Decimal(str(pricing_rule["min_fee"]))
     fees = quantize_money(max(min_fee, fixed_fee + variable_fee))
-    target_amount = quantize_money((source_amount - fees) * fx_rate, "0.000001")
+
+    # Appliquer le spread configuré dans admin Frais → taux effectif plus bas
+    spread = get_intl_spread()
+    effective_rate = fx_rate * (Decimal("1") - spread)
+
+    target_amount = quantize_money((source_amount - fees) * effective_rate, "0.000001")
     if target_amount <= 0:
         raise HTTPException(status_code=400, detail="Amount is too small after fees")
     return {
@@ -95,4 +114,6 @@ def calculate_quote_amounts(
         "min_fee": min_fee,
         "fees": fees,
         "target_amount": target_amount,
+        "spread_rate": spread,
+        "effective_fx_rate": effective_rate,
     }

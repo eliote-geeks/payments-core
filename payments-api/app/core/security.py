@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import uuid
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import jwt
+import psycopg
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.core.config import settings
+from app.db.session import get_conn
 
 
 def utcnow() -> datetime:
@@ -31,7 +35,9 @@ class AuthUser:
     phone_e164: str
 
 
-def create_access_token(*, user_id: str, phone_e164: str) -> str:
+def create_access_token(*, user_id: str, phone_e164: str, jti: str | None = None) -> str:
+    if jti is None:
+        jti = uuid.uuid4().hex
     now = utcnow()
     payload: dict[str, Any] = {
         "iss": settings.jwt_issuer,
@@ -40,8 +46,40 @@ def create_access_token(*, user_id: str, phone_e164: str) -> str:
         "exp": int((now + timedelta(minutes=settings.jwt_access_token_minutes)).timestamp()),
         "sub": user_id,
         "phone": phone_e164,
+        "jti": jti,
     }
     return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
+
+
+def _touch_session(jti: str) -> bool:
+    """Update last_seen_at and return False if session is revoked."""
+    now = utcnow()
+    with closing(get_conn()) as conn, conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+        cur.execute(
+            "SELECT revoked, last_seen_at FROM sessions WHERE jti = %s LIMIT 1",
+            (jti,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return False
+        if row["revoked"]:
+            return False
+        # Update last_seen only if > 2 minutes since last update
+        last = row["last_seen_at"]
+        if last is None or (now - last).total_seconds() > 120:
+            cur.execute("UPDATE sessions SET last_seen_at = %s WHERE jti = %s", (now, jti))
+            conn.commit()
+    return True
+
+
+def _is_user_blocked(user_id: str) -> bool:
+    with closing(get_conn()) as conn, conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+        cur.execute(
+            "SELECT is_blocked, blocked FROM users WHERE id = %s LIMIT 1",
+            (user_id,),
+        )
+        row = cur.fetchone()
+    return bool(row and (row.get("is_blocked") or row.get("blocked")))
 
 
 bearer = HTTPBearer(auto_error=False)
@@ -67,5 +105,9 @@ def require_user(
     phone = str(payload.get("phone", ""))
     if not user_id or not phone:
         raise HTTPException(status_code=401, detail="Invalid token payload")
+    jti = payload.get("jti")
+    if jti and not _touch_session(jti):
+        raise HTTPException(status_code=401, detail="Session révoquée")
+    if _is_user_blocked(user_id):
+        raise HTTPException(status_code=403, detail="account_blocked")
     return AuthUser(id=user_id, phone_e164=phone)
-
